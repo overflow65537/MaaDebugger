@@ -8,7 +8,11 @@ from maa.tasker import Tasker, RecognitionDetail, NotificationHandler
 from maa.resource import Resource
 from maa.toolkit import Toolkit, AdbDevice, DesktopWindow
 from PIL import Image
+import os
+from typing import Dict
+import json
 
+import importlib.util
 from ..utils import cvmat_to_image
 
 
@@ -29,7 +33,94 @@ class MaaFW:
 
         self.screenshotter = Screenshotter(self.screencap)
         self.notification_handler = None
+    def load_custom_objects(self, custom_dir):
+        if not os.path.exists(custom_dir):
+            print(f"自定义文件夹 {custom_dir} 不存在")
+            return
+        if not os.listdir(custom_dir):
+            print(f"自定义文件夹 {custom_dir} 为空")
+            return
+        if os.path.exists(os.path.join(custom_dir, "custom.json")):
+            print("配置文件方案")
+            with open(os.path.join(custom_dir, "custom.json"), "r", encoding="utf-8") as MAA_Config:
+                custom_config: Dict[str, Dict] = json.load(MAA_Config)
+            
+            for custom_name, custom in custom_config.items():
+                custom_type:str = custom.get("type")
+                custom_class_name:str = custom.get("class")
+                custom_file_path:str = custom.get("file_path")
+                if '{custom_path}' in custom_file_path:
+                    custom_file_path = custom_file_path.replace("{custom_path}", str(custom_dir))
 
+
+                if not all([custom_type, custom_name, custom_class_name, custom_file_path]):
+                    print(f"配置项 {custom} 缺少必要信息，跳过")
+                    continue
+
+                try:
+                    print(f"custom_type: {custom_type}, custom_name: {custom_name}, custom_class_name: {custom_class_name}, custom_file_path: {custom_file_path}")
+                    module_name = os.path.splitext(os.path.basename(custom_file_path))[0]
+                    # 动态导入模块
+                    spec = importlib.util.spec_from_file_location(module_name, custom_file_path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    print(f"模块 {module} 导入成功")
+
+                    # 获取类对象
+                    class_obj = getattr(module, custom_class_name)
+
+                    # 实例化类
+                    instance = class_obj()
+
+                    if custom_type == "action":
+                        if self.resource.register_custom_action(custom_name, instance):
+                            print(f"加载自定义动作{custom_name}")
+                
+                    elif custom_type == "recognition":
+                        if self.resource.register_custom_recognition(custom_name, instance):
+                            print(f"加载自定义识别器{custom_name}")
+        
+                except (ImportError, AttributeError, FileNotFoundError) as e:
+                    print(f"加载自定义 {custom_name} 时出错: {e}")
+
+
+        for module_type in ["action", "recognition"]:
+            
+            module_type_dir = os.path.join(custom_dir, module_type)
+            if not os.path.exists(module_type_dir):
+                print(f"{module_type} 文件夹不存在于 {custom_dir}")
+                continue
+            print(f"文件夹方案{module_type}")
+            for subdir in os.listdir(module_type_dir):
+                subdir_path = os.path.join(module_type_dir, subdir)
+                if os.path.isdir(subdir_path):
+                    entry_file = os.path.join(subdir_path, "main.py")
+                    if not os.path.exists(entry_file):
+                        print(f"{subdir_path} 没有main.py")
+                        continue  # 如果没有找到main.py，则跳过该子目录
+
+                    try:
+
+                        module_name = subdir  # 使用子目录名作为模块名
+                        spec = importlib.util.spec_from_file_location(
+                            module_name, entry_file
+                        )
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
+                        if module_type == "action":
+                            if self.resource.register_custom_action(
+                                f"{module_name}", getattr(module, module_name)()
+                            ):
+                                print(
+                                    f"加载自定义动作{module_name},{getattr(module, module_name)()}"
+                                )
+                        elif module_type == "recognition":
+                            if self.resource.register_custom_recognition(
+                                f"{module_name}", getattr(module, module_name)()
+                            ):
+                                print(f"加载自定义识别器{module_name}")
+                    except Exception as e:
+                        print(f"加载自定义内容时发生错误{entry_file}: {e}")
     @staticmethod
     @asyncify
     def detect_adb() -> List[AdbDevice]:
@@ -79,7 +170,7 @@ class MaaFW:
     def load_resource(self, dir: List[Path]) -> bool:
         if not self.resource:
             self.resource = Resource()
-
+        self.custom_path = []
         self.resource.clear()
         for d in dir:
             if not d.exists():
@@ -88,6 +179,7 @@ class MaaFW:
             status = self.resource.post_bundle(d).wait().succeeded
             if not status:
                 return False
+            self.custom_path.append(d)
         return True
 
     @asyncify
@@ -103,7 +195,10 @@ class MaaFW:
         if not self.tasker.inited:
             print("Failed to init MaaFramework tasker")
             return False
-
+        self.resource.clear_custom_recognition()
+        self.resource.clear_custom_recognition()
+        for d in self.custom_path:
+            self.load_custom_objects(d.parent.parent / "custom")
         return self.tasker.post_task(entry, pipeline_override).wait().succeeded
 
     @asyncify
